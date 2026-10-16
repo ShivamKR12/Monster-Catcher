@@ -1,0 +1,2184 @@
+
+================================================================================
+FILE: D:\Monster-Catcher\code\battle.py
+================================================================================
+from settings import * 
+from sprites import MonsterSprite, MonsterNameSprite, MonsterLevelSprite, MonsterStatsSprite, MonsterOutlineSprite, AttackSprite, TimedSprite
+from groups import BattleSprites
+from game_data import ATTACK_DATA
+from support import draw_bar
+from timer import Timer # type: ignore
+from random import choice
+
+class Battle:
+	# main
+	def __init__(self, player_monsters, opponent_monsters, monster_frames, bg_surf, fonts, end_battle, character, sounds):
+		# general
+		self.display_surface = pygame.display.get_surface()
+		self.bg_surf = bg_surf
+		self.monster_frames = monster_frames
+		self.fonts = fonts
+		self.monster_data = {'player': player_monsters, 'opponent': opponent_monsters}
+		self.battle_over = False
+		self.end_battle = end_battle
+		self.character = character
+		self.sounds = sounds
+
+		# timers 
+		self.timers = {
+			'opponent delay': Timer(600, func = self.opponent_attack)
+		}
+
+		# groups
+		self.battle_sprites   = BattleSprites()
+		self.player_sprites   = pygame.sprite.Group()
+		self.opponent_sprites = pygame.sprite.Group()
+
+		# control
+		self.current_monster = None
+		self.selection_mode  = None
+		self.selected_attack = None
+		self.selection_side  = 'player'
+		self.indexes = {
+			'general': 0,
+			'monster': 0,
+			'attacks': 0,
+			'switch' : 0,
+			'target' : 0,
+		}
+
+		self.setup()
+
+	def setup(self):
+		for entity, monster in self.monster_data.items():
+			for index, monster in {k:v for k,v in monster.items() if k <= 2}.items():
+				self.create_monster(monster, index, index, entity)
+
+			# remove opponent monster data 
+			for i in range(len(self.opponent_sprites)):
+				del self.monster_data['opponent'][i]
+
+	def create_monster(self, monster, index, pos_index, entity):
+		monster.paused = False
+		frames = self.monster_frames['monsters'][monster.name]
+		outline_frames = self.monster_frames['outlines'][monster.name]
+		if entity == 'player':
+			pos = list(BATTLE_POSITIONS['left'].values())[pos_index]
+			groups = (self.battle_sprites, self.player_sprites)
+			frames = {state: [pygame.transform.flip(frame, True, False) for frame in frames] for state, frames in frames.items()}
+			outline_frames = {state: [pygame.transform.flip(frame, True, False) for frame in frames] for state, frames in outline_frames.items()}
+		else:
+			pos = list(BATTLE_POSITIONS['right'].values())[pos_index]
+			groups = (self.battle_sprites, self.opponent_sprites)
+
+		monster_sprite = MonsterSprite(pos, frames, groups, monster, index, pos_index, entity, self.apply_attack, self.create_monster)
+		MonsterOutlineSprite(monster_sprite, self.battle_sprites, outline_frames)
+
+		# ui
+		name_pos = monster_sprite.rect.midleft + vector(16,-70) if entity == 'player' else monster_sprite.rect.midright + vector(-40,-70)
+		name_sprite = MonsterNameSprite(name_pos, monster_sprite, self.battle_sprites, self.fonts['regular'])
+		level_pos = name_sprite.rect.bottomleft if entity == 'player' else name_sprite.rect.bottomright 
+		MonsterLevelSprite(entity, level_pos, monster_sprite, self.battle_sprites, self.fonts['small'])
+		MonsterStatsSprite(monster_sprite.rect.midbottom + vector(0,20), monster_sprite, (150,48), self.battle_sprites, self.fonts['small'])
+
+	def input(self):
+		if self.selection_mode and self.current_monster:
+			keys = pygame.key.get_just_pressed()
+
+			match self.selection_mode:
+				case 'general': limiter = len(BATTLE_CHOICES['full'])
+				case 'attacks': limiter = len(self.current_monster.monster.get_abilities(all = False))
+				case 'switch': limiter = len(self.available_monsters)
+				case 'target': limiter = len(self.opponent_sprites) if self.selection_side == 'opponent' else len(self.player_sprites)
+
+			if keys[pygame.K_DOWN]:
+				self.indexes[self.selection_mode] = (self.indexes[self.selection_mode] + 1) % limiter
+			if keys[pygame.K_UP]:
+				self.indexes[self.selection_mode] = (self.indexes[self.selection_mode] - 1) % limiter
+			if keys[pygame.K_SPACE]:
+				
+				if self.selection_mode == 'switch':
+					index, new_monster = list(self.available_monsters.items())[self.indexes['switch']]
+					self.current_monster.kill()
+					self.create_monster(new_monster, index, self.current_monster.pos_index, 'player')
+					self.selection_mode = None
+					self.update_all_monsters('resume')
+
+				if self.selection_mode == 'target':
+					sprite_group = self.opponent_sprites if self.selection_side == 'opponent' else self.player_sprites
+					sprites = {sprite.pos_index: sprite for sprite in sprite_group}
+					monster_sprite = sprites[list(sprites.keys())[self.indexes['target']]]
+
+					if self.selected_attack:
+						self.current_monster.activate_attack(monster_sprite, self.selected_attack)
+						self.selected_attack, self.current_monster, self.selection_mode = None, None, None
+					else:
+						if monster_sprite.monster.health < monster_sprite.monster.get_stat('max_health') * 0.9:
+							self.monster_data['player'][len(self.monster_data['player'])] = monster_sprite.monster
+							monster_sprite.delayed_kill(None)
+							self.update_all_monsters('resume')
+						else:
+							TimedSprite(monster_sprite.rect.center, self.monster_frames['ui']['cross'], self.battle_sprites, 1000)
+
+				if self.selection_mode == 'attacks':
+					self.selection_mode = 'target'
+					self.selected_attack = self.current_monster.monster.get_abilities(all = False)[self.indexes['attacks']]
+					self.selection_side = ATTACK_DATA[self.selected_attack]['target']
+
+				if self.selection_mode == 'general':
+					if self.indexes['general'] == 0:
+						self.selection_mode = 'attacks'
+					
+					if self.indexes['general'] == 1:
+						self.current_monster.monster.defending = True
+						self.update_all_monsters('resume')
+						self.current_monster, self.selection_mode = None, None
+						self.indexes['general'] = 0
+					
+					if self.indexes['general'] == 2:
+						self.selection_mode = 'switch'
+
+					if self.indexes['general'] == 3:
+						self.selection_mode = 'target'
+						self.selection_side = 'opponent'
+				self.indexes = {k: 0 for k in self.indexes}
+
+			if keys[pygame.K_ESCAPE]:
+				if self.selection_mode in ('attacks', 'switch', 'target'):
+					self.selection_mode = 'general'
+
+	def update_timers(self):
+		for timer in self.timers.values():
+			timer.update()
+
+
+	# battle system
+	def check_active(self):
+		for monster_sprite in self.player_sprites.sprites() + self.opponent_sprites.sprites():
+			if monster_sprite.monster.initiative >= 100:
+				monster_sprite.monster.defending = False
+				self.update_all_monsters('pause')
+				monster_sprite.monster.initiative = 0
+				monster_sprite.set_highlight(True)
+				self.current_monster = monster_sprite
+				if self.player_sprites in monster_sprite.groups():
+					self.selection_mode = 'general'
+				else:
+					self.timers['opponent delay'].activate()
+
+	def update_all_monsters(self, option):
+		for monster_sprite in self.player_sprites.sprites() + self.opponent_sprites.sprites():
+			monster_sprite.monster.paused = True if option == 'pause' else False
+
+	def apply_attack(self, target_sprite, attack, amount):
+		AttackSprite(target_sprite.rect.center, self.monster_frames['attacks'][ATTACK_DATA[attack]['animation']], self.battle_sprites)
+		self.sounds[ATTACK_DATA[attack]['animation']].play()
+
+		# get correct attack damage amount (defense, element)
+		attack_element = ATTACK_DATA[attack]['element']
+		target_element = target_sprite.monster.element
+
+		# double attack
+		if attack_element == 'fire'  and target_element == 'plant' or \
+		   attack_element == 'water' and target_element == 'fire'  or \
+		   attack_element == 'plant' and target_element == 'water':
+			amount *= 2
+
+		# halve attack
+		if attack_element == 'fire'  and target_element == 'water' or \
+		   attack_element == 'water' and target_element == 'plant' or \
+		   attack_element == 'plant' and target_element == 'fire':
+			amount *= 0.5
+
+		target_defense = 1 - target_sprite.monster.get_stat('defense') / 2000
+		if target_sprite.monster.defending:
+			target_defense -= 0.2
+		target_defense = max(0, min(1, target_defense))
+
+		# update the monster health 
+		target_sprite.monster.health -= amount * target_defense
+		self.check_death()
+
+		# resume 
+		self.update_all_monsters('resume')
+
+	def check_death(self):
+		for monster_sprite in self.opponent_sprites.sprites() + self.player_sprites.sprites():
+			if monster_sprite.monster.health <= 0:
+				if self.player_sprites in monster_sprite.groups(): # player
+					active_monsters = [(monster_sprite.index, monster_sprite.monster) for monster_sprite in self.player_sprites.sprites()]
+					available_monsters = [(index, monster) for index, monster in self.monster_data['player'].items() if monster.health > 0 and (index, monster) not in active_monsters]
+					if available_monsters:
+						new_monster_data = [(monster, index, monster_sprite.pos_index, 'player') for index, monster in available_monsters][0]
+					else:
+						new_monster_data = None
+				else:
+					new_monster_data = (list(self.monster_data['opponent'].values())[0], monster_sprite.index, monster_sprite.pos_index, 'opponent') if self.monster_data['opponent'] else None
+					if self.monster_data['opponent']:
+						del self.monster_data['opponent'][min(self.monster_data['opponent'])]
+					# xp
+					xp_amount = monster_sprite.monster.level * 100 / len(self.player_sprites)
+					for player_sprite in self.player_sprites:
+						player_sprite.monster.update_xp(xp_amount)
+
+				monster_sprite.delayed_kill(new_monster_data)
+
+	def opponent_attack(self):
+		ability = choice(self.current_monster.monster.get_abilities())
+		random_target = choice(self.opponent_sprites.sprites()) if ATTACK_DATA[ability]['target'] == 'player' else choice(self.player_sprites.sprites())
+		self.current_monster.activate_attack(random_target, ability)
+
+	def check_end_battle(self):
+		# opponents have been defeated 
+		if len(self.opponent_sprites) == 0 and not self.battle_over:
+			self.battle_over = True
+			self.end_battle(self.character)
+			for monster in self. monster_data['player'].values():
+				monster.initiative = 0
+
+		# player has been defeated 
+		if len(self.player_sprites) == 0:
+			pygame.quit()
+			exit()
+
+
+	# ui 
+	def draw_ui(self):
+		if self.current_monster:
+			if self.selection_mode == 'general':
+				self.draw_general()
+			if self.selection_mode == 'attacks':
+				self.draw_attacks()
+			if self.selection_mode == 'switch':
+				self.draw_switch()
+
+	def draw_general(self):
+		for index, (option, data_dict) in enumerate(BATTLE_CHOICES['full'].items()):
+			if index == self.indexes['general']:
+				surf = self.monster_frames['ui'][f"{data_dict['icon']}_highlight"]
+			else:
+				surf = pygame.transform.grayscale(self.monster_frames['ui'][data_dict['icon']])
+			rect = surf.get_frect(center = self.current_monster.rect.midright + data_dict['pos'])
+			self.display_surface.blit(surf, rect)
+
+	def draw_attacks(self):
+		# data
+		abilities = self.current_monster.monster.get_abilities(all = False)
+		width, height = 150, 200
+		visible_attacks = 4
+		item_height = height / visible_attacks
+		v_offset = 0 if self.indexes['attacks'] < visible_attacks else -(self.indexes['attacks'] - visible_attacks + 1) * item_height
+
+		# bg
+		bg_rect = pygame.FRect((0,0), (width,height)).move_to(midleft = self.current_monster.rect.midright + vector(20,0))
+		pygame.draw.rect(self.display_surface, COLORS['white'], bg_rect, 0, 5)
+
+		for index, ability in enumerate(abilities):
+			selected = index == self.indexes['attacks']
+
+			# text 
+			if selected:
+				element = ATTACK_DATA[ability]['element']
+				text_color = COLORS[element] if element!= 'normal' else COLORS['black']
+			else:
+				text_color = COLORS['light']
+			text_surf  = self.fonts['regular'].render(ability, False, text_color)
+
+			# rect 
+			text_rect = text_surf.get_frect(center = bg_rect.midtop + vector(0, item_height / 2 + index * item_height + v_offset))
+			text_bg_rect = pygame.FRect((0,0), (width, item_height)).move_to(center = text_rect.center)
+
+			# draw
+			if bg_rect.collidepoint(text_rect.center):
+				if selected:
+					if text_bg_rect.collidepoint(bg_rect.topleft):
+						pygame.draw.rect(self.display_surface, COLORS['dark white'], text_bg_rect,0,0,5,5)
+					elif text_bg_rect.collidepoint(bg_rect.midbottom + vector(0,-1)):
+						pygame.draw.rect(self.display_surface, COLORS['dark white'], text_bg_rect,0,0,0,0,5,5)
+					else:
+						pygame.draw.rect(self.display_surface, COLORS['dark white'], text_bg_rect)
+
+				self.display_surface.blit(text_surf, text_rect)
+
+	def draw_switch(self):
+		# data 
+		width, height = 300, 320
+		visible_monsters = 4
+		item_height = height / visible_monsters
+		v_offset = 0 if self.indexes['switch'] < visible_monsters else -(self.indexes['switch'] - visible_monsters + 1) * item_height
+		bg_rect = pygame.FRect((0,0), (width, height)).move_to(midleft = self.current_monster.rect.midright + vector(20,0))
+		pygame.draw.rect(self.display_surface, COLORS['white'], bg_rect, 0, 5)
+
+		# monsters 
+		active_monsters = [(monster_sprite.index, monster_sprite.monster) for monster_sprite in self.player_sprites]
+		self.available_monsters = {index: monster for index, monster in self.monster_data['player'].items() if (index, monster) not in active_monsters and monster.health > 0}
+
+		for index, monster in enumerate(self.available_monsters.values()):
+			selected = index == self.indexes['switch']
+			item_bg_rect = pygame.FRect((0,0), (width, item_height)).move_to(midleft = (bg_rect.left, bg_rect.top + item_height / 2 + index * item_height + v_offset))
+
+			icon_surf = self.monster_frames['icons'][monster.name]
+			icon_rect = icon_surf.get_frect(midleft = bg_rect.topleft + vector(10,item_height / 2 + index * item_height + v_offset))
+			text_surf = self.fonts['regular'].render(f'{monster.name} ({monster.level})', False, COLORS['red'] if selected else COLORS['black'])
+			text_rect = text_surf.get_frect(topleft = (bg_rect.left + 90, icon_rect.top))
+
+			# selection bg
+			if selected:
+				if item_bg_rect.collidepoint(bg_rect.topleft):
+					pygame.draw.rect(self.display_surface, COLORS['dark white'], item_bg_rect, 0, 0, 5, 5)
+				elif item_bg_rect.collidepoint(bg_rect.midbottom + vector(0,-1)):
+					pygame.draw.rect(self.display_surface, COLORS['dark white'], item_bg_rect, 0, 0, 0, 0, 5, 5)
+				else:
+					pygame.draw.rect(self.display_surface, COLORS['dark white'], item_bg_rect)
+
+			if bg_rect.collidepoint(item_bg_rect.center):
+				for surf, rect in ((icon_surf, icon_rect), (text_surf, text_rect)):
+					self.display_surface.blit(surf, rect)
+				health_rect = pygame.FRect((text_rect.bottomleft + vector(0,4)), (100,4))
+				energy_rect = pygame.FRect((health_rect.bottomleft + vector(0,2)), (80,4))
+				draw_bar(self.display_surface, health_rect, monster.health, monster.get_stat('max_health'), COLORS['red'], COLORS['black'])
+				draw_bar(self.display_surface, energy_rect, monster.energy, monster.get_stat('max_energy'), COLORS['blue'], COLORS['black'])
+
+	def update(self, dt):
+		self.check_end_battle()
+		
+		# updates
+		self.input()
+		self.update_timers()
+		self.battle_sprites.update(dt)
+		self.check_active()
+
+		# drawing
+		self.display_surface.blit(self.bg_surf, (0,0))
+		self.battle_sprites.draw(self.current_monster, self.selection_side, self.selection_mode, self.indexes['target'], self.player_sprites, self.opponent_sprites)
+		self.draw_ui()
+
+================================================================================
+FILE: D:\Monster-Catcher\code\debug.py
+================================================================================
+import pygame
+pygame.init()
+font = pygame.font.Font(None,30)
+
+def debug(info,y = 10, x = 10):
+	display_surface = pygame.display.get_surface()
+	debug_surf = font.render(str(info),True,'White')
+	debug_rect = debug_surf.get_rect(topleft = (x,y))
+	pygame.draw.rect(display_surface,'Black',debug_rect)
+	display_surface.blit(debug_surf,debug_rect)
+
+
+================================================================================
+FILE: D:\Monster-Catcher\code\dialog.py
+================================================================================
+from settings import * 
+from timer import Timer # type: ignore
+
+class DialogTree:
+	def __init__(self, character, player, all_sprites, font, end_dialog):
+		self.player = player
+		self.character = character
+		self.font = font 
+		self.all_sprites = all_sprites
+		self.end_dialog = end_dialog
+		
+		self.dialog = character.get_dialog()
+		self.dialog_num = len(self.dialog)
+		self.dialog_index = 0
+
+		self.current_dialog = DialogSprite(self.dialog[self.dialog_index], self.character, self.all_sprites, self.font)
+		self.dialog_timer = Timer(500, autostart = True)
+
+	def input(self):
+		keys = pygame.key.get_just_pressed()
+		if keys[pygame.K_SPACE] and not self.dialog_timer.active:
+			self.current_dialog.kill()
+			self.dialog_index += 1
+			if self.dialog_index < self.dialog_num:
+				self.current_dialog = DialogSprite(self.dialog[self.dialog_index], self.character, self.all_sprites, self.font)
+				self.dialog_timer.activate()
+			else:
+				self.end_dialog(self.character)
+
+	def update(self):
+		self.dialog_timer.update()
+		self.input()
+
+class DialogSprite(pygame.sprite.Sprite):
+	def __init__(self, message, character, groups, font):
+		super().__init__(groups)
+		self.z = WORLD_LAYERS['top']
+
+		# text 
+		text_surf = font.render(message, False, COLORS['black'])
+		padding = 5
+		width = max(30, text_surf.get_width() + padding * 2)
+		height = text_surf.get_height() + padding * 2
+
+		# background
+		surf = pygame.Surface((width, height), pygame.SRCALPHA)
+		surf.fill((0,0,0,0))
+		pygame.draw.rect(surf, COLORS['pure white'], surf.get_frect(topleft = (0,0)),0, 4)
+		surf.blit(text_surf, text_surf.get_frect(center = (width / 2, height / 2)))
+
+		self.image = surf
+		self.rect = self.image.get_frect(midbottom = character.rect.midtop + vector(0,-10))
+
+================================================================================
+FILE: D:\Monster-Catcher\code\entities.py
+================================================================================
+from settings import * 
+from support import check_connections
+from timer import Timer # type: ignore
+from random import choice
+from monster import Monster
+
+class Entity(pygame.sprite.Sprite):
+	def __init__(self, pos, frames, groups, facing_direction):
+		super().__init__(groups)
+		self.z = WORLD_LAYERS['main']
+
+		# graphics 
+		self.frame_index, self.frames = 0, frames
+		self.facing_direction = facing_direction
+
+		# movement 
+		self.direction = vector()
+		self.speed = 250
+		self.blocked = False
+
+		# sprite setup
+		self.image = self.frames[self.get_state()][self.frame_index]
+		self.rect = self.image.get_frect(center = pos)
+		self.hitbox = self.rect.inflate(-self.rect.width / 2, -60)
+
+		self.y_sort = self.rect.centery
+
+	def animate(self, dt):
+		self.frame_index += ANIMATION_SPEED * dt
+		self.image = self.frames[self.get_state()][int(self.frame_index % len(self.frames[self.get_state()]))]
+
+	def get_state(self):
+		moving = bool(self.direction)
+		if moving:
+			if self.direction.x != 0:
+				self.facing_direction = 'right' if self.direction.x > 0 else 'left'
+			if self.direction.y != 0:
+				self.facing_direction = 'down' if self.direction.y > 0 else 'up'
+		return f"{self.facing_direction}{'' if moving else '_idle'}"
+
+	def change_facing_direction(self, target_pos):
+		relation = vector(target_pos) - vector(self.rect.center)
+		if abs(relation.y) < 30:
+			self.facing_direction = 'right' if relation.x > 0 else 'left'
+		else:
+			self.facing_direction = 'down' if relation.y > 0 else 'up'
+
+	def block(self):
+		self.blocked = True
+		self.direction = vector(0,0)
+
+	def unblock(self):
+		self.blocked = False
+
+class Character(Entity):
+	def __init__(self, pos, frames, groups, facing_direction, character_data, player, create_dialog, collision_sprites, radius, nurse, notice_sound):
+		super().__init__(pos, frames, groups, facing_direction)
+		self.character_data = character_data
+		self.player = player
+		self.create_dialog = create_dialog
+		self.collision_rects = [sprite.rect for sprite in collision_sprites if sprite is not self]
+		self.nurse = nurse
+		self.monsters = {i: Monster(name, lvl) for i, (name, lvl) in character_data['monsters'].items()} if 'monsters' in character_data else None
+
+		# movement 
+		self.has_moved = False
+		self.can_rotate = True
+		self.has_noticed = False
+		self.radius = int(radius)
+		self.view_directions = character_data['directions']
+
+		self.timers = {
+			'look around': Timer(1500, autostart = True, repeat = True, func = self.random_view_direction),
+			'notice': Timer(500, func = self.start_move)
+		}
+		self.notice_sound = notice_sound
+
+	def random_view_direction(self):
+		if self.can_rotate:
+			self.facing_direction = choice(self.view_directions)
+
+	def get_dialog(self):
+		return self.character_data['dialog'][f"{'defeated' if self.character_data['defeated'] else 'default'}"]
+
+	def raycast(self):
+		if check_connections(self.radius, self, self.player) and self.has_los() and not self.has_moved and not self.has_noticed:
+			self.player.block()
+			self.player.change_facing_direction(self.rect.center)
+			self.timers['notice'].activate()
+			self.can_rotate = False
+			self.has_noticed = True
+			self.player.noticed = True
+			self.notice_sound.play()
+
+	def has_los(self):
+		if vector(self.rect.center).distance_to(self.player.rect.center) < self.radius:
+			collisions = [bool(rect.clipline(self.rect.center, self.player.rect.center)) for rect in self.collision_rects]
+			return not any(collisions)
+
+	def start_move(self):
+		relation = (vector(self.player.rect.center) - vector(self.rect.center)).normalize()
+		self.direction = vector(round(relation.x), round(relation.y))
+
+	def move(self, dt):
+		if not self.has_moved and self.direction:
+			if not self.hitbox.inflate(10,10).colliderect(self.player.hitbox):
+				self.rect.center += self.direction * self.speed * dt
+				self.hitbox.center = self.rect.center
+			else:
+				self.direction = vector()
+				self.has_moved = True
+				self.create_dialog(self)
+				self.player.noticed = False
+
+	def update(self, dt):
+		for timer in self.timers.values():
+			timer.update()
+
+		self.animate(dt)
+		if self.character_data['look_around']:
+			self.raycast()
+			self.move(dt)
+
+class Player(Entity):
+	def __init__(self, pos, frames, groups, facing_direction, collision_sprites):
+		super().__init__(pos, frames, groups, facing_direction)
+		self.collision_sprites = collision_sprites
+		self.noticed = False
+
+	def input(self):
+		keys = pygame.key.get_pressed()
+		input_vector = vector()
+		if keys[pygame.K_UP]:
+			input_vector.y -= 1
+		if keys[pygame.K_DOWN]:
+			input_vector.y += 1
+		if keys[pygame.K_LEFT]:
+			input_vector.x -= 1
+		if keys[pygame.K_RIGHT]:
+			input_vector.x += 1
+		self.direction = input_vector.normalize() if input_vector else input_vector
+
+	def move(self, dt):
+		self.rect.centerx += self.direction.x * self.speed * dt
+		self.hitbox.centerx = self.rect.centerx
+		self.collisions('horizontal')
+
+		self.rect.centery += self.direction.y * self.speed * dt
+		self.hitbox.centery = self.rect.centery
+		self.collisions('vertical')
+
+	def collisions(self, axis):
+		for sprite in self.collision_sprites:
+			if sprite.hitbox.colliderect(self.hitbox):
+				if axis == 'horizontal':
+					if self.direction.x > 0: 
+						self.hitbox.right = sprite.hitbox.left
+					if self.direction.x < 0:
+						self.hitbox.left = sprite.hitbox.right
+					self.rect.centerx = self.hitbox.centerx
+				else:
+					if self.direction.y > 0:
+						self.hitbox.bottom = sprite.hitbox.top
+					if self.direction.y < 0:
+						self.hitbox.top = sprite.hitbox.bottom
+					self.rect.centery = self.hitbox.centery
+
+	def update(self, dt):
+		self.y_sort = self.rect.centery
+		if not self.blocked:
+			self.input()
+			self.move(dt)
+		self.animate(dt)
+
+================================================================================
+FILE: D:\Monster-Catcher\code\evolution.py
+================================================================================
+from settings import * 
+from timer import Timer # type: ignore
+
+class Evolution:
+	def __init__(self, frames, start_monster, end_monster, font, end_evolution, star_frames):
+		self.display_surface = pygame.display.get_surface()
+		self.start_monster_surf = pygame.transform.scale2x(frames[start_monster]['idle'][0])
+		self.end_monster_surf = pygame.transform.scale2x(frames[end_monster]['idle'][0])
+		self.timers = {
+			'start': Timer(800, autostart = True),
+			'end': Timer(1800, func = end_evolution)
+		}
+
+		# star animation
+		self.star_frames = [pygame.transform.scale2x(frame) for frame in star_frames]
+		self.frame_index = 0
+
+		# screen tint
+		self.tint_surf = pygame.Surface(self.display_surface.get_size())
+		self.tint_surf.set_alpha(200)
+
+		# white tint 
+		self.start_monster_surf_white = pygame.mask.from_surface(self.start_monster_surf).to_surface()
+		self.start_monster_surf_white.set_colorkey('black')
+		self.tint_amount, self.tint_speed = 0, 80
+		self.start_monster_surf_white.set_alpha(self.tint_amount)
+
+		# text 
+		self.start_text_surf = font.render(f'{start_monster} is evolving', False, COLORS['black'])
+		self.end_text_surf = font.render(f'{start_monster} evolved into {end_monster}', False, COLORS['black'])
+
+	def display_stars(self, dt):
+		self.frame_index += 20 * dt
+		if self.frame_index < len(self.star_frames):
+			frame = self.star_frames[int(self.frame_index)]
+			rect = frame.get_frect(center = (WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2))
+			self.display_surface.blit(frame, rect)
+
+	def update(self, dt):
+		for timer in self.timers.values():
+			timer.update()
+
+		if not self.timers['start'].active:
+			self.display_surface.blit(self.tint_surf, (0,0))
+			if self.tint_amount < 255:
+				rect = self.start_monster_surf.get_frect(center = (WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2))
+				self.display_surface.blit(self.start_monster_surf, rect)
+
+				self.tint_amount += self.tint_speed * dt
+				self.start_monster_surf_white.set_alpha(self.tint_amount)
+				self.display_surface.blit(self.start_monster_surf_white, rect)
+
+				text_rect = self.start_text_surf.get_frect(midtop = rect.midbottom + vector(0,20))
+				pygame.draw.rect(self.display_surface, COLORS['white'], text_rect.inflate(20,20), 0, 5)
+				self.display_surface.blit(self.start_text_surf, text_rect)
+
+			else:
+				rect = self.end_monster_surf.get_frect(center = (WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2))
+				self.display_surface.blit(self.end_monster_surf, rect)
+				
+				text_rect = self.end_text_surf.get_frect(midtop = rect.midbottom + vector(0,20))
+				pygame.draw.rect(self.display_surface, COLORS['white'], text_rect.inflate(20,20), 0, 5)
+				self.display_surface.blit(self.end_text_surf, text_rect)
+				self.display_stars(dt)
+
+				if not self.timers['end'].active:
+					self.timers['end'].activate()
+
+================================================================================
+FILE: D:\Monster-Catcher\code\game_data.py
+================================================================================
+TRAINER_DATA = {
+	'o1': {
+		'monsters': {0: ('Jacana', 14), 1: ('Cleaf', 15)},
+		'dialog': {
+			'default': ['Hey, how are you?', 'Oh, so you want to fight?', 'FIGHT!'], 
+			'defeated': ['You are very strong!', 'Let\'s fight again sometime?']},
+		'directions': ['down'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'o2': {
+		'monsters': {0: ('Atrox', 14), 1: ('Pouch', 15), 2: ('Draem', 13), 3: ('Cindrill', 13)},
+		'dialog': {
+			'default': ['I don\'t like sand', 'It\'s coarse and rough', 'oh god, fight'], 
+			'defeated': ['May the force be with you']},
+		'directions': ['left', 'down'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'o3': {
+		'monsters': {0: ('Atrox', 14), 1: ('Pouch', 15), 2: ('Draem', 13), 3: ('Cindrill', 13)},
+		'dialog': {
+			'default': ['I love skating!', 'FIGHT!'], 
+			'defeated': ['Good luck with the boss', 'It\'s so cold in here']},
+		'directions': ['left', 'right', 'up', 'down'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'o4': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I love skating!', 'FIGHT!'], 
+			'defeated': ['Good luck with the boss', 'It\'s so cold in here']},
+		'directions': ['right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'o5': {
+		'monsters': {0: ('Plumette', 20), 1: ('Ivieron', 22), 2: ('Atrox',24), 3: ('Pouch', 19)},
+		'dialog': {
+			'default': ['So you want to challenge the big ones', 'This will be fun!'], 
+			'defeated': ['I hope the lawyers will never spot you', '<3']},
+		'directions': ['up', 'right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'o6': {
+		'monsters': {0: ('Finsta', 15), 1: ('Finsta', 15), 2: ('Finsta', 15)},
+		'dialog': {
+			'default': ['I love skating!', 'FIGHT!'], 
+			'defeated': ['Good luck with the boss', 'It\'s so cold in here']},
+		'directions': ['down'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'o7': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['There are no bugs in the snow!'], 
+			'defeated': ['Maybe I should check a vulcano...', 'It\'s so cold in here']},
+		'directions': ['right'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'p1': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I love trees', 'and fights'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'p2': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I love trees', 'and fights'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'p3': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I love trees', 'and fights'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'p4': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I love trees', 'and fights'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'px': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Atrox',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I love trees', 'and fights'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'forest'
+		},
+	'w1': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Draem',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['It\'s so cold in here', 'maybe a fight will warm me up'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['left'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'w2': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Draem',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['It\'s so cold in here', 'maybe a fight will warm me up'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'w3': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Draem',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['It\'s so cold in here', 'maybe a fight will warm me up'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'w4': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Draem',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['It\'s so cold in here', 'maybe a fight will warm me up'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['left'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'w5': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Draem',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['It\'s so cold in here', 'maybe a fight will warm me up'], 
+			'defeated': ['Good luck with the boss!']},
+		'directions': ['right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'wx': {
+		'monsters': {0: ('Friolera', 25), 1: ('Gulfin', 20), 2: ('Draem',24), 3: ('Finiette', 30)},
+		'dialog': {
+			'default': ['I hope you brought rations', 'This will be a long journey'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['down'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'ice'
+		},
+	'f1': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['This place feels kinda warm...', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'f2': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['This place feels kinda warm...', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['right', 'left'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'f3': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['This place feels kinda warm...', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['right', 'left'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'f4': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['This place feels kinda warm...', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['up', 'right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'f5': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['This place feels kinda warm...', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['left'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'f6': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['This place feels kinda warm...', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['right'],
+		'look_around': True,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'fx': {
+		'monsters': {0: ('Cindrill', 15), 1: ('Jacana', 20), 2: ('Draem',24), 3: ('Atrox', 30)},
+		'dialog': {
+			'default': ['Time to bring the heat', 'fight!'], 
+			'defeated': ['Congratultion!']},
+		'directions': ['down'],
+		'look_around': False,
+		'defeated': False,
+		'biome': 'sand'
+		},
+	'Nurse': {
+		'direction': 'down',
+		'radius': 0,
+		'look_around': False,
+		'dialog': {
+			'default': ['Welcome to the hospital', 'Your monsters have been healed'], 
+			'defeated': None},
+		'directions': ['down'],
+		'defeated': False,
+		'biome': None
+		}
+}
+
+MONSTER_DATA = {
+	'Plumette': {
+		'stats': {'element': 'plant', 'max_health': 15, 'max_energy': 17, 'attack': 4, 'defense': 8, 'recovery': 1, 'speed': 1},
+		'abilities': {0: 'scratch', 5: 'spark'},
+		'evolve': ('Ivieron', 15)},
+	'Ivieron': {
+		'stats': {'element': 'plant', 'max_health': 18, 'max_energy': 20, 'attack': 5, 'defense': 10, 'recovery': 1.2, 'speed': 1.2},
+		'abilities': {0: 'scratch', 5: 'spark'},
+		'evolve': ('Pluma', 32)},
+	'Pluma': {
+		'stats': {'element': 'plant', 'max_health': 23, 'max_energy': 26, 'attack': 6, 'defense': 12, 'recovery': 1.8, 'speed': 1.8},
+		'abilities': {0: 'scratch', 5: 'spark'},
+		'evolve': None},
+	'Sparchu': {
+		'stats': {'element': 'fire', 'max_health': 15, 'max_energy': 7, 'attack': 3, 'defense': 8, 'recovery': 1.1, 'speed': 1},
+		'abilities': {0: 'scratch', 5: 'fire', 15: 'battlecry', 26:'explosion'},
+		'evolve': ('Cindrill', 15)},
+	'Cindrill': {
+		'stats': {'element': 'fire', 'max_health': 18, 'max_energy': 10, 'attack': 3.5, 'defense': 10, 'recovery': 1.2, 'speed': 1.1},
+		'abilities': {0: 'scratch', 5: 'fire', 15: 'battlecry', 26:'explosion'},
+		'evolve': ('Charmadillo', 33)},
+	'Charmadillo': {
+		'stats': {'element': 'fire', 'max_health': 29, 'max_energy': 12, 'attack': 4, 'defense': 17, 'recovery': 1.35, 'speed': 1.1},
+		'abilities': {0: 'scratch', 5: 'fire', 15: 'battlecry', 26:'explosion', 45: 'annihilate'},
+		'evolve': None},
+	'Finsta': {
+		'stats': {'element': 'water', 'max_health': 13, 'max_energy': 17, 'attack': 2, 'defense': 8, 'recovery': 1.5, 'speed': 1.8},
+		'abilities': {0: 'scratch', 5: 'spark', 15: 'splash', 20: 'ice', 25: 'heal'},
+		'evolve': ('Gulfin', 34)},
+	'Gulfin': {
+		'stats': {'element': 'water', 'max_health': 18, 'max_energy': 20, 'attack': 3, 'defense': 10, 'recovery': 1.8, 'speed': 2},
+		'abilities': {0: 'scratch', 5: 'spark', 15: 'splash', 20: 'ice', 25: 'heal'},
+		'evolve': ('Finiette', 45)},
+	'Finiette': {
+		'stats': {'element': 'water', 'max_health': 27, 'max_energy': 23, 'attack': 4, 'defense': 17, 'recovery': 2, 'speed': 2.5},
+		'abilities': {0: 'scratch', 5: 'spark', 15: 'splash', 20: 'ice', 25: 'heal'},
+		'evolve': None},
+	'Atrox': {
+		'stats': {'element': 'fire', 'max_health': 18, 'max_energy': 20, 'attack': 3, 'defense': 10, 'recovery': 1.3, 'speed': 1.9},
+		'abilities': {0: 'scratch', 5: 'spark', 30: 'fire'},
+		'evolve': None},
+	'Pouch': {
+		'stats': {'element': 'plant', 'max_health': 23, 'max_energy': 25, 'attack': 4, 'defense': 12, 'recovery': 1, 'speed': 1.5},
+		'abilities': {0: 'scratch', 5: 'spark', 25: 'heal'},
+		'evolve': None},
+	'Draem': {
+		'stats': {'element': 'plant', 'max_health': 23, 'max_energy': 25, 'attack': 4, 'defense': 12, 'recovery': 1.2, 'speed': 1.4},
+		'abilities': {0: 'scratch', 5: 'heal', 20: 'explosion', 25: 'splash'},
+		'evolve': None},
+	'Larvea': {
+		'stats': {'element': 'plant', 'max_health': 15, 'max_energy': 17, 'attack': 1, 'defense': 8, 'recovery': 1, 'speed': 1},
+		'abilities': {0: 'scratch', 5: 'spark'},
+		'evolve': ('Cleaf', 4)},
+	'Cleaf': {
+		'stats': {'element': 'plant', 'max_health': 18, 'max_energy': 20, 'attack': 3, 'defense': 10, 'recovery': 1.7, 'speed': 1.6},
+		'abilities': {0: 'scratch', 5: 'heal'},
+		'evolve': None},
+	'Jacana': {
+		'stats': {'element': 'fire', 'max_health': 12, 'max_energy': 19, 'attack': 3, 'defense': 10, 'recovery': 2.1, 'speed': 2.6},
+		'abilities': {0: 'scratch', 5: 'spark', 15: 'burn', 20: 'explosion', 25: 'heal'},
+		'evolve': None},
+	'Friolera': {
+		'stats': {'element': 'water', 'max_health': 13, 'max_energy': 20, 'attack': 4, 'defense': 6, 'recovery': 1.3, 'speed': 2},
+		'abilities': {0: 'scratch', 5: 'spark', 15: 'splash', 20: 'ice', 25: 'heal'},
+		'evolve': None},
+}
+
+ATTACK_DATA = {
+	'burn':       {'target': 'opponent', 'amount': 2,    'cost': 15, 'element': 'fire',   'animation': 'fire'},
+	'heal':       {'target': 'player',   'amount': -1.2, 'cost': 600, 'element': 'plant',  'animation': 'green'},
+	'battlecry':  {'target': 'player',   'amount': -1.4, 'cost': 20, 'element': 'normal', 'animation': 'green'},
+	'spark':      {'target': 'opponent', 'amount': 1.1,  'cost': 20, 'element': 'fire',   'animation': 'fire'},
+	'scratch':    {'target': 'opponent', 'amount': 1.2,  'cost': 20, 'element': 'normal', 'animation': 'scratch'},
+	'splash':     {'target': 'opponent', 'amount': 2,    'cost': 15, 'element': 'water',  'animation': 'splash'},
+	'fire':       {'target': 'opponent', 'amount': 2,    'cost': 15, 'element': 'fire',   'animation': 'fire'},
+	'explosion':  {'target': 'opponent', 'amount': 2,    'cost': 90, 'element': 'fire',   'animation': 'explosion'},
+	'annihilate': {'target': 'opponent', 'amount': 3,    'cost': 30, 'element': 'fire',   'animation': 'explosion'},
+	'ice':        {'target': 'opponent', 'amount': 2,    'cost': 15, 'element': 'water',  'animation': 'ice'},
+}
+
+================================================================================
+FILE: D:\Monster-Catcher\code\groups.py
+================================================================================
+from settings import * 
+from support import import_image
+from entities import Entity
+
+class AllSprites(pygame.sprite.Group):
+	def __init__(self):
+		super().__init__()
+		self.display_surface = pygame.display.get_surface()
+		self.offset = vector()
+		self.shadow_surf = import_image('..', 'graphics', 'other', 'shadow')
+		self.notice_surf = import_image('..', 'graphics', 'ui', 'notice')
+
+	def draw(self, player):
+		self.offset.x = -(player.rect.centerx - WINDOW_WIDTH / 2)
+		self.offset.y = -(player.rect.centery - WINDOW_HEIGHT / 2)
+
+		bg_sprites = [sprite for sprite in self if sprite.z < WORLD_LAYERS['main']]
+		main_sprites = sorted([sprite for sprite in self if sprite.z == WORLD_LAYERS['main']], key = lambda sprite: sprite.y_sort)
+		fg_sprites = [sprite for sprite in self if sprite.z > WORLD_LAYERS['main']]
+
+		for layer in (bg_sprites, main_sprites, fg_sprites):
+			for sprite in layer:
+				if isinstance(sprite, Entity):
+					self.display_surface.blit(self.shadow_surf, sprite.rect.topleft + self.offset + vector(40,110))
+				self.display_surface.blit(sprite.image, sprite.rect.topleft + self.offset)
+				if sprite == player and player.noticed:
+					rect = self.notice_surf.get_frect(midbottom = sprite.rect.midtop)
+					self.display_surface.blit(self.notice_surf, rect.topleft + self.offset)
+
+class BattleSprites(pygame.sprite.Group):
+	def __init__(self):
+		super().__init__()
+		self.display_surface = pygame.display.get_surface()
+
+	def draw(self, current_monster_sprite, side, mode, target_index, player_sprites, opponent_sprites):
+		# get available positions 
+		sprite_group = opponent_sprites if side == 'opponent' else player_sprites
+		sprites = {sprite.pos_index: sprite for sprite in sprite_group}
+		monster_sprite = sprites[list(sprites.keys())[target_index]] if sprites else None
+
+		for sprite in sorted(self, key = lambda sprite: sprite.z):
+			if sprite.z == BATTLE_LAYERS['outline']:
+				if sprite.monster_sprite == current_monster_sprite and not (mode == 'target' and side == 'player') or\
+				   sprite.monster_sprite == monster_sprite and sprite.monster_sprite.entity == side and mode and mode == 'target':
+					self.display_surface.blit(sprite.image, sprite.rect)
+			else:
+				self.display_surface.blit(sprite.image, sprite.rect)
+
+================================================================================
+FILE: D:\Monster-Catcher\code\main.py
+================================================================================
+from settings import *
+from game_data import *
+from pytmx.util_pygame import load_pygame
+from os.path import join
+from random import randint
+
+from sprites import Sprite, AnimatedSprite, MonsterPatchSprite, BorderSprite, CollidableSprite, TransitionSprite
+from entities import Player, Character
+from groups import AllSprites
+from dialog import DialogTree
+from monster_index import MonsterIndex
+from battle import Battle
+from timer import Timer # type: ignore
+from evolution import Evolution
+
+from support import *
+from monster import Monster
+
+class Game:
+	# general 
+	def __init__(self):
+		pygame.init()
+		self.display_surface = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+		pygame.display.set_caption('Monster Catcher')
+		self.clock = pygame.time.Clock()
+		self.encounter_timer = Timer(2000, func = self.monster_encounter)
+
+		# player monsters 
+		self.player_monsters = {
+			0: Monster('Ivieron', 32),
+			1: Monster('Atrox', 15),
+			2: Monster('Cindrill', 33),# 16
+			3: Monster('Atrox', 10),
+			4: Monster('Sparchu', 33),# 11
+			5: Monster('Gulfin', 45),# 9
+			6: Monster('Jacana', 10),
+		}
+		for monster in self.player_monsters.values():
+			monster.xp += randint(0,monster.level * 100)
+		self.test_monsters = {
+			0: Monster('Finsta', 15),
+			1: Monster('Pouch', 13),
+			2: Monster('Larvea', 12),
+		}
+
+
+		# groups 
+		self.all_sprites = AllSprites()
+		self.collision_sprites = pygame.sprite.Group()
+		self.character_sprites = pygame.sprite.Group()
+		self.transition_sprites = pygame.sprite.Group()
+		self.monster_sprites = pygame.sprite.Group()
+
+		# transition / tint
+		self.transition_target = None
+		self.tint_surf = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+		self.tint_mode = 'untint'
+		self.tint_progress = 0
+		self.tint_direction = -1
+		self.tint_speed = 600
+
+		self.import_assets()
+		self.setup(self.tmx_maps['world'], 'house')
+		self.audio['overworld'].play(-1)
+
+		# overlays 
+		self.dialog_tree = None
+		self.monster_index = MonsterIndex(self.player_monsters, self.fonts, self.monster_frames)
+		self.index_open = False
+		self.battle = None
+		self.evolution = None
+
+
+	def import_assets(self):
+		self.tmx_maps = tmx_importer('..', 'data', 'maps')
+
+		self.overworld_frames = {
+			'water': import_folder('..', 'graphics', 'tilesets', 'water'),
+			'coast': coast_importer(24, 12, '..', 'graphics', 'tilesets', 'coast'),
+			'characters': all_character_import('..', 'graphics', 'characters')
+		}
+
+		self.monster_frames = {
+			'icons': import_folder_dict('..', 'graphics', 'icons'),
+			'monsters': monster_importer(4,2,'..', 'graphics', 'monsters'),
+			'ui': import_folder_dict('..', 'graphics', 'ui'),
+			'attacks': attack_importer('..', 'graphics', 'attacks')
+		}
+		self.monster_frames['outlines'] = outline_creator(self.monster_frames['monsters'], 4)
+
+		self.fonts = {
+			'dialog': pygame.font.Font(join('..', 'graphics', 'fonts', 'PixeloidSans.ttf'), 30),
+			'regular': pygame.font.Font(join('..', 'graphics', 'fonts', 'PixeloidSans.ttf'), 18),
+			'small': pygame.font.Font(join('..', 'graphics', 'fonts', 'PixeloidSans.ttf'), 14),
+			'bold': pygame.font.Font(join('..', 'graphics', 'fonts', 'dogicapixelbold.otf'), 20),
+		}
+		self.bg_frames = import_folder_dict('..', 'graphics', 'backgrounds')
+		self.start_animation_frames = import_folder('..', 'graphics', 'other', 'star animation')
+	
+		self.audio = audio_importer('..', 'audio')
+
+	def setup(self, tmx_map, player_start_pos):
+		# clear the map
+		for group in (self.all_sprites, self.collision_sprites, self.transition_sprites, self.character_sprites):
+			group.empty()
+
+		# terrain
+		for layer in ['Terrain', 'Terrain Top']:
+			for x, y, surf in tmx_map.get_layer_by_name(layer).tiles():
+				Sprite((x * TILE_SIZE, y * TILE_SIZE), surf, self.all_sprites, WORLD_LAYERS['bg'])
+
+		# water 
+		for obj in tmx_map.get_layer_by_name('Water'):
+			for x in range(int(obj.x), int(obj.x + obj.width), TILE_SIZE):
+				for y in range(int(obj.y), int(obj.y + obj.height), TILE_SIZE):
+					AnimatedSprite((x,y), self.overworld_frames['water'], self.all_sprites, WORLD_LAYERS['water'])
+
+		# coast
+		for obj in tmx_map.get_layer_by_name('Coast'):
+			terrain = obj.properties['terrain']
+			side = obj.properties['side']
+			AnimatedSprite((obj.x, obj.y), self.overworld_frames['coast'][terrain][side], self.all_sprites, WORLD_LAYERS['bg'])
+		
+		# objects 
+		for obj in tmx_map.get_layer_by_name('Objects'):
+			if obj.name == 'top':
+				Sprite((obj.x, obj.y), obj.image, self.all_sprites, WORLD_LAYERS['top'])
+			else:
+				CollidableSprite((obj.x, obj.y), obj.image, (self.all_sprites, self.collision_sprites))
+
+		# transition objects
+		for obj in tmx_map.get_layer_by_name('Transition'):
+			TransitionSprite((obj.x, obj.y), (obj.width, obj.height), (obj.properties['target'], obj.properties['pos']), self.transition_sprites)
+
+		# collision objects 
+		for obj in tmx_map.get_layer_by_name('Collisions'):
+			BorderSprite((obj.x, obj.y), pygame.Surface((obj.width, obj.height)), self.collision_sprites)
+
+		# grass patches 
+		for obj in tmx_map.get_layer_by_name('Monsters'):
+			MonsterPatchSprite((obj.x, obj.y), obj.image, (self.all_sprites, self.monster_sprites), obj.properties['biome'], obj.properties['monsters'], obj.properties['level'])
+
+		# entities 
+		for obj in tmx_map.get_layer_by_name('Entities'):
+			if obj.name == 'Player':
+				if obj.properties['pos'] == player_start_pos:
+					self.player = Player(
+						pos = (obj.x, obj.y), 
+						frames = self.overworld_frames['characters']['player'], 
+						groups = self.all_sprites,
+						facing_direction = obj.properties['direction'], 
+						collision_sprites = self.collision_sprites)
+			else:
+				Character(
+					pos = (obj.x, obj.y), 
+					frames = self.overworld_frames['characters'][obj.properties['graphic']], 
+					groups = (self.all_sprites, self.collision_sprites, self.character_sprites),
+					facing_direction = obj.properties.get('direction', 'down'),
+					character_data = TRAINER_DATA[obj.properties['character_id']],
+					player = self.player,
+					create_dialog = self.create_dialog,
+					collision_sprites = self.collision_sprites,
+					radius = obj.properties.get('radius', 100),
+					nurse = obj.properties['character_id'] == 'Nurse',
+					notice_sound = self.audio['notice'])
+
+	# dialog system
+	def input(self):
+		if not self.dialog_tree and not self.battle:
+			keys = pygame.key.get_just_pressed()
+			if keys[pygame.K_SPACE]:
+				for character in self.character_sprites:
+					if check_connections(100, self.player, character):
+						self.player.block()
+						character.change_facing_direction(self.player.rect.center)
+						self.create_dialog(character)
+						character.can_rotate = False
+
+			if keys[pygame.K_RETURN]:
+				self.index_open = not self.index_open
+				self.player.blocked = not self.player.blocked
+
+	def create_dialog(self, character):
+		if not self.dialog_tree:
+			self.dialog_tree = DialogTree(character, self.player, self.all_sprites, self.fonts['dialog'], self.end_dialog)
+
+	def end_dialog(self, character):
+		self.dialog_tree = None
+		if character.nurse:
+			for monster in self.player_monsters.values():
+				monster.health = monster.get_stat('max_health')
+				monster.energy = monster.get_stat('max_energy')
+
+			self.player.unblock()
+		elif not character.character_data['defeated']:
+			self.audio['overworld'].stop()
+			self.audio['battle'].play(-1)
+			self.transition_target = Battle(
+				player_monsters = self.player_monsters, 
+				opponent_monsters = character.monsters, 
+				monster_frames = self.monster_frames, 
+				bg_surf = self.bg_frames[character.character_data['biome']], 
+				fonts = self.fonts, 
+				end_battle = self.end_battle,
+				character = character, 
+				sounds = self.audio)
+			self.tint_mode = 'tint'
+		else:
+			self.player.unblock()
+			self.check_evolution()
+
+	# transition system
+	def transition_check(self):
+		sprites = [sprite for sprite in self.transition_sprites if sprite.rect.colliderect(self.player.hitbox)]
+		if sprites:
+			self.player.block()
+			self.transition_target = sprites[0].target
+			self.tint_mode = 'tint'
+
+	def tint_screen(self, dt):
+		if self.tint_mode == 'untint':
+			self.tint_progress -= self.tint_speed * dt
+
+		if self.tint_mode == 'tint':
+			self.tint_progress += self.tint_speed * dt
+			if self.tint_progress >= 255:
+				if type(self.transition_target) == Battle:
+					self.battle = self.transition_target
+				elif self.transition_target == 'level':
+					self.battle = None
+				else:
+					self.setup(self.tmx_maps[self.transition_target[0]], self.transition_target[1])
+				self.tint_mode = 'untint'
+				self.transition_target = None
+
+		self.tint_progress = max(0, min(self.tint_progress, 255))
+		self.tint_surf.set_alpha(self.tint_progress)
+		self.display_surface.blit(self.tint_surf, (0,0))
+	
+	def end_battle(self, character):
+		self.audio['battle'].stop()
+		self.transition_target = 'level'
+		self.tint_mode = 'tint'
+		if character:
+			character.character_data['defeated'] = True
+			self.create_dialog(character)
+		elif not self.evolution:
+			self.player.unblock()
+			self.check_evolution()
+
+	def check_evolution(self):
+		for index, monster in self.player_monsters.items():
+			if monster.evolution:
+				if monster.level == monster.evolution[1]:
+					self.audio['evolution'].play()
+					self.player.block()
+					self.evolution = Evolution(self.monster_frames['monsters'], monster.name, monster.evolution[0], self.fonts['bold'], self.end_evolution, self.start_animation_frames)
+					self.player_monsters[index] = Monster(monster.evolution[0], monster.level)
+		if not self.evolution:
+			self.audio['overworld'].play(-1)
+
+	def end_evolution(self):
+		self.evolution = None
+		self.player.unblock()
+		self.audio['evolution'].stop()
+		self.audio['overworld'].play(-1)
+
+	# monster encounters 
+	def check_monster(self):
+		if [sprite for sprite in self.monster_sprites if sprite.rect.colliderect(self.player.hitbox)] and not self.battle and self.player.direction:
+			if not self.encounter_timer.active:
+				self.encounter_timer.activate()
+
+	def monster_encounter(self):
+		sprites = [sprite for sprite in self.monster_sprites if sprite.rect.colliderect(self.player.hitbox)]
+		if sprites and self.player.direction:
+			self.encounter_timer.duration = randint(800, 2500)
+			self.player.block()
+			self.audio['overworld'].stop()
+			self.audio['battle'].play(-1)
+			self.transition_target = Battle(
+				player_monsters = self.player_monsters, 
+				opponent_monsters = {index:Monster(monster, sprites[0].level + randint(-3,3)) for index, monster in enumerate(sprites[0].monsters)}, 
+				monster_frames = self.monster_frames, 
+				bg_surf = self.bg_frames[sprites[0].biome], 
+				fonts = self.fonts, 
+				end_battle = self.end_battle,
+				character = None, 
+				sounds = self.audio)
+			self.tint_mode = 'tint'
+
+	def run(self):
+		while True:
+			dt = self.clock.tick() / 1000
+			self.display_surface.fill('black')
+
+			# event loop 
+			for event in pygame.event.get():
+				if event.type == pygame.QUIT:
+					pygame.quit()
+					exit()
+
+			# update 
+			self.encounter_timer.update()
+			self.input()
+			self.transition_check()
+			self.all_sprites.update(dt)
+			self.check_monster()
+			
+			# drawing
+			self.all_sprites.draw(self.player)
+			
+			# overlays 
+			if self.dialog_tree: self.dialog_tree.update()
+			if self.index_open:  self.monster_index.update(dt)
+			if self.battle:      self.battle.update(dt)
+			if self.evolution:   self.evolution.update(dt)
+
+			self.tint_screen(dt)
+			pygame.display.update()
+
+if __name__ == '__main__':
+	game = Game()
+	game.run()
+
+================================================================================
+FILE: D:\Monster-Catcher\code\monster.py
+================================================================================
+from game_data import MONSTER_DATA, ATTACK_DATA
+from random import randint
+
+class Monster:
+	def __init__(self, name, level):
+		self.name, self.level = name, level
+		self.paused = False
+
+		# stats 
+		self.element = MONSTER_DATA[name]['stats']['element']
+		self.base_stats = MONSTER_DATA[name]['stats']
+		self.health = self.base_stats['max_health'] * self.level
+		self.energy = self.base_stats['max_energy'] * self.level
+		self.initiative = 0
+		self.abilities = MONSTER_DATA[name]['abilities']
+		self.defending = False
+
+		# experience
+		self.xp = 0
+		self.level_up = self.level * 150
+		self.evolution = MONSTER_DATA[self.name]['evolve']
+
+	def __repr__(self):
+		return f'monster: {self.name}, lvl: {self.level}'
+
+	def get_stat(self, stat):
+		return self.base_stats[stat] * self.level
+
+	def get_stats(self):
+		return {
+			'health': self.get_stat('max_health'),
+			'energy': self.get_stat('max_energy'),
+			'attack': self.get_stat('attack'),
+			'defense': self.get_stat('defense'),
+			'speed': self.get_stat('speed'),
+			'recovery': self.get_stat('recovery'),
+		}
+
+	def get_abilities(self, all  = True):
+		if all:
+			return [ability for lvl, ability in self.abilities.items() if self.level >= lvl]
+		else:
+			return [ability for lvl, ability in self.abilities.items() if self.level >= lvl and ATTACK_DATA[ability]['cost'] < self.energy]
+
+	def get_info(self):
+		return (
+			(self.health, self.get_stat('max_health')),
+			(self.energy, self.get_stat('max_energy')),
+			(self.initiative, 100)
+			)
+
+	def reduce_energy(self, attack):
+		self.energy -= ATTACK_DATA[attack]['cost']
+
+	def get_base_damage(self, attack):
+		return self.get_stat('attack') * ATTACK_DATA[attack]['amount']
+
+	def update_xp(self, amount):
+		if self.level_up - self.xp > amount:
+			self.xp += amount
+		else:
+			self.level += 1
+			self.xp = amount - (self.level_up - self.xp)
+			self.level_up = self.level * 150
+
+	def stat_limiter(self):
+		self.health = max(0, min(self.health, self.get_stat('max_health')))
+		self.energy = max(0, min(self.energy, self.get_stat('max_energy')))
+
+	def update(self, dt):
+		self.stat_limiter()
+		if not self.paused:
+			self.initiative += self.get_stat('speed') * dt
+
+================================================================================
+FILE: D:\Monster-Catcher\code\monster_index.py
+================================================================================
+from settings import * 
+from support import draw_bar
+from game_data import MONSTER_DATA, ATTACK_DATA
+
+class MonsterIndex:
+	def __init__(self, monsters, fonts, monster_frames):
+		self.display_surface = pygame.display.get_surface()
+		self.fonts = fonts
+		self.monsters = monsters
+		self.frame_index = 0
+
+		# frames 
+		self.icon_frames = monster_frames['icons']
+		self.monster_frames = monster_frames['monsters']
+		self.ui_frames = monster_frames['ui']
+
+		# tint surf 
+		self.tint_surf = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+		self.tint_surf.set_alpha(200)
+
+		# dimensions 
+		self.main_rect = pygame.FRect(0,0,WINDOW_WIDTH * 0.6,WINDOW_HEIGHT * 0.8).move_to(center = (WINDOW_WIDTH / 2, WINDOW_HEIGHT / 2))
+
+		# list 
+		self.visible_items = 6
+		self.list_width = self.main_rect.width * 0.3
+		self.item_height = self.main_rect.height / self.visible_items
+		self.index = 0
+		self.selected_index = None
+
+		# max values 
+		self.max_stats = {}
+		for data in MONSTER_DATA.values():
+			for stat, value in data['stats'].items():
+				if stat != 'element':
+					if stat not in self.max_stats:
+						self.max_stats[stat] = value
+					else:
+						self.max_stats[stat] = value if value > self.max_stats[stat] else self.max_stats[stat]
+		self.max_stats['health'] = self.max_stats.pop('max_health')
+		self.max_stats['energy'] = self.max_stats.pop('max_energy')
+
+	def input(self):
+		keys = pygame.key.get_just_pressed()
+		if keys[pygame.K_UP]:
+			self.index -= 1
+		if keys[pygame.K_DOWN]:
+			self.index += 1
+		if keys[pygame.K_SPACE]:
+			if self.selected_index != None:
+				selected_monster = self.monsters[self.selected_index]
+				current_monster  = self.monsters[self.index]
+				self.monsters[self.index] = selected_monster
+				self.monsters[self.selected_index] = current_monster
+				self.selected_index = None
+			else:
+				self.selected_index = self.index
+
+		self.index = self.index % len(self.monsters)
+
+	def display_list(self):
+		bg_rect = pygame.FRect(self.main_rect.topleft,(self.list_width, self.main_rect.height))
+		pygame.draw.rect(self.display_surface, COLORS['gray'], bg_rect,0,0,12,0,12,0)
+
+		v_offset = 0 if self.index < self.visible_items else -(self.index - self.visible_items + 1) * self.item_height
+		for index, monster in self.monsters.items():
+			# colors 
+			bg_color = COLORS['gray'] if self.index != index else COLORS['light']
+			text_color = COLORS['white'] if self.selected_index != index else COLORS['gold']
+
+			top = self.main_rect.top + index * self.item_height + v_offset
+			item_rect = pygame.FRect(self.main_rect.left,top,self.list_width,self.item_height)
+			
+			text_surf = self.fonts['regular'].render(monster.name, False, text_color)
+			text_rect = text_surf.get_frect(midleft = item_rect.midleft + vector(90, 0))
+
+			icon_surf = self.icon_frames[monster.name]
+			icon_rect = icon_surf.get_frect(center = item_rect.midleft + vector(45,0))
+
+			if item_rect.colliderect(self.main_rect):
+				# check corners
+				if item_rect.collidepoint(self.main_rect.topleft):
+					pygame.draw.rect(self.display_surface, bg_color, item_rect,0,0,12)
+				elif item_rect.collidepoint(self.main_rect.bottomleft + vector(1,-1)):
+					pygame.draw.rect(self.display_surface, bg_color, item_rect,0,0,0,0,12,0)
+				else:
+					pygame.draw.rect(self.display_surface, bg_color, item_rect)
+				
+				self.display_surface.blit(text_surf, text_rect)
+				self.display_surface.blit(icon_surf, icon_rect)
+
+		# lines 
+		for i in range(1, min(self.visible_items, len(self.monsters))):
+			y = self.main_rect.top + self.item_height * i
+			left = self.main_rect.left
+			right = self.main_rect.left + self.list_width
+			pygame.draw.line(self.display_surface, COLORS['light-gray'], (left, y), (right, y))
+
+		# shadow
+		shadow_surf = pygame.Surface((4,self.main_rect.height))
+		shadow_surf.set_alpha(100)
+		self.display_surface.blit(shadow_surf,(self.main_rect.left + self.list_width - 4,self.main_rect.top))
+	
+	def display_main(self, dt):
+		# data 
+		monster = self.monsters[self.index]
+
+		# main bg
+		rect = pygame.FRect(self.main_rect.left + self.list_width,self.main_rect.top, self.main_rect.width - self.list_width, self.main_rect.height)
+		pygame.draw.rect(self.display_surface, COLORS['dark'], rect, 0, 12,0, 12,0)
+
+		# monster display
+		top_rect = pygame.FRect(rect.topleft, (rect.width, rect.height * 0.4))
+		pygame.draw.rect(self.display_surface, COLORS[monster.element], top_rect, 0,0,0,12)
+
+		# monster animation 
+		self.frame_index += ANIMATION_SPEED * dt
+		monster_surf = self.monster_frames[monster.name]['idle'][int(self.frame_index) % len(self.monster_frames[monster.name]['idle'])]
+		monster_rect = monster_surf.get_frect(center = top_rect.center)
+		self.display_surface.blit(monster_surf, monster_rect)
+
+		# name 
+		name_surf = self.fonts['bold'].render(monster.name, False, COLORS['white'])
+		name_rect = name_surf.get_frect(topleft = top_rect.topleft + vector(10,10))
+		self.display_surface.blit(name_surf, name_rect)
+
+		# level
+		level_surf = self.fonts['regular'].render(f'Lvl: {monster.level}', False, COLORS['white'])
+		level_rect = level_surf.get_frect(bottomleft = top_rect.bottomleft + vector(10,-16))
+		self.display_surface.blit(level_surf, level_rect)
+		draw_bar(
+			surface = self.display_surface, 
+			rect = pygame.FRect(level_rect.bottomleft, (100,4)), 
+			value = monster.xp, 
+			max_value = monster.level_up, 
+			color = COLORS['white'], 
+			bg_color = COLORS['dark'])
+
+		# element
+		element_surf = self.fonts['regular'].render(monster.element, False, COLORS['white'])
+		element_rect = element_surf.get_frect(bottomright = top_rect.bottomright + vector(-10,-10))
+		self.display_surface.blit(element_surf, element_rect)
+
+		# health and energy
+		bar_data = {
+			'width': rect.width * 0.45,
+			'height': 30,
+			'top': top_rect.bottom + rect.width * 0.03,
+			'left_side': rect.left + rect.width / 4,
+			'right_side': rect.left + rect.width * 3/4
+		}
+
+		healthbar_rect = pygame.FRect((0,0), (bar_data['width'],bar_data['height'])).move_to(midtop = (bar_data['left_side'], bar_data['top']))
+		draw_bar(self.display_surface, healthbar_rect, monster.health, monster.get_stat('max_health'), COLORS['red'], COLORS['black'], 2)
+		hp_text = self.fonts['regular'].render(f"HP: {int(monster.health)}/{int(monster.get_stat('max_health'))}", False, COLORS['white'])
+		hp_rect = hp_text.get_frect(midleft = healthbar_rect.midleft + vector(10,0))
+		self.display_surface.blit(hp_text, hp_rect)
+
+		energybar_rect = pygame.FRect((0,0), (bar_data['width'],bar_data['height'])).move_to(midtop = (bar_data['right_side'], bar_data['top']))
+		draw_bar(self.display_surface, energybar_rect, monster.energy, monster.get_stat('max_energy'), COLORS['blue'], COLORS['black'], 2)
+		ep_text = self.fonts['regular'].render(f"EP: {int(monster.energy)}/{int(monster.get_stat('max_energy'))}", False, COLORS['white'])
+		ep_rect = ep_text.get_frect(midleft = energybar_rect.midleft + vector(10,0))
+		self.display_surface.blit(ep_text, ep_rect)
+
+		# info 
+		sides = {'left': healthbar_rect.left, 'right': energybar_rect.left}
+		info_height = rect.bottom - healthbar_rect.bottom
+
+		# stats 
+		stats_rect = pygame.FRect(sides['left'], healthbar_rect.bottom, healthbar_rect.width, info_height).inflate(0,-60).move(0,15)
+		stats_text_surf = self.fonts['regular'].render('Stats', False, COLORS['white'])
+		stats_text_rect = stats_text_surf.get_frect(bottomleft = stats_rect.topleft)
+		self.display_surface.blit(stats_text_surf, stats_text_rect)
+
+		monster_stats = monster.get_stats()
+		stat_height = stats_rect.height / len(monster_stats)
+
+		for index, (stat, value) in enumerate(monster_stats.items()):
+			single_stat_rect = pygame.FRect(stats_rect.left,stats_rect.top + index * stat_height,stats_rect.width,stat_height)
+
+			# icon 
+			icon_surf = self.ui_frames[stat]
+			icon_rect = icon_surf.get_frect(midleft = single_stat_rect.midleft + vector(5,0))
+			self.display_surface.blit(icon_surf, icon_rect)
+
+			# text 
+			text_surf = self.fonts['regular'].render(stat, False, COLORS['white'])
+			text_rect = text_surf.get_frect(topleft = icon_rect.topleft + vector(30,-10))
+			self.display_surface.blit(text_surf, text_rect)
+
+			# bar 
+			bar_rect = pygame.FRect((text_rect.left, text_rect.bottom + 2), (single_stat_rect.width  - (text_rect.left - single_stat_rect.left),4))
+			draw_bar(self.display_surface, bar_rect, value, self.max_stats[stat] * monster.level, COLORS['white'], COLORS['black'])
+
+
+		# abilities 
+		ability_rect = stats_rect.copy().move_to(left = sides['right'])
+		ability_text_surf = self.fonts['regular'].render('Ability', False, COLORS['white'])
+		ability_text_rect = ability_text_surf.get_frect(bottomleft = ability_rect.topleft)
+		self.display_surface.blit(ability_text_surf, ability_text_rect)
+
+		for index, ability in enumerate(monster.get_abilities()):
+			element = ATTACK_DATA[ability]['element']
+
+			text_surf = self.fonts['regular'].render(ability, False, COLORS['black'])
+			x = ability_rect.left + index % 2 * ability_rect.width / 2
+			y = 20 + ability_rect.top + int(index / 2) * (text_surf.get_height() + 20)
+			rect = text_surf.get_frect(topleft = (x,y))
+			pygame.draw.rect(self.display_surface, COLORS[element], rect.inflate(10,10), 0, 4)
+			self.display_surface.blit(text_surf, rect)
+
+	def update(self, dt):
+		self.input()
+		self.display_surface.blit(self.tint_surf, (0,0))
+		self.display_list() 
+		self.display_main(dt)
+
+================================================================================
+FILE: D:\Monster-Catcher\code\settings.py
+================================================================================
+import pygame
+from pygame.math import Vector2 as vector 
+from sys import exit
+
+WINDOW_WIDTH, WINDOW_HEIGHT = 1280, 720
+TILE_SIZE = 64 
+ANIMATION_SPEED = 6
+BATTLE_OUTLINE_WIDTH = 4
+
+COLORS = {
+	'white': '#f4fefa', 
+	'pure white': '#ffffff',
+	'dark': '#2b292c',
+	'light': '#c8c8c8',
+	'gray': '#3a373b',
+	'gold': '#ffd700',
+	'light-gray': '#4b484d',
+	'fire':'#f8a060',
+	'water':'#50b0d8',
+	'plant': '#64a990', 
+	'black': '#000000', 
+	'red': '#f03131',
+	'blue': '#66d7ee',
+	'normal': '#ffffff',
+	'dark white': '#f0f0f0'
+}
+
+WORLD_LAYERS = {
+	'water': 0,
+	'bg': 1,
+	'shadow': 2,
+	'main': 3,
+	'top': 4
+}
+
+BATTLE_POSITIONS = {
+	'left': {'top': (360, 260), 'center': (190, 400), 'bottom': (410, 520)},
+	'right': {'top': (900, 260), 'center': (1110, 390), 'bottom': (900, 550)}
+}
+
+BATTLE_LAYERS =  {
+	'outline': 0,
+	'name': 1,
+	'monster': 2,
+	'effects': 3,
+	'overlay': 4
+}
+
+BATTLE_CHOICES = {
+	'full': {
+		'fight':  {'pos' : vector(30, -60), 'icon': 'sword'},
+		'defend': {'pos' : vector(40, -20), 'icon': 'shield'},
+		'switch': {'pos' : vector(40, 20), 'icon': 'arrows'},
+		'catch':  {'pos' : vector(30, 60), 'icon': 'hand'}},
+	
+	'limited': {
+		'fight':  {'pos' : vector(30, -40), 'icon': 'sword'},
+		'defend': {'pos' : vector(40, 0), 'icon': 'shield'},
+		'switch': {'pos' : vector(30, 40), 'icon': 'arrows'}}
+}
+
+================================================================================
+FILE: D:\Monster-Catcher\code\sprites.py
+================================================================================
+from settings import * 
+from random import uniform
+from support import draw_bar
+from timer import Timer # type: ignore
+
+# overworld sprites
+class Sprite(pygame.sprite.Sprite):
+	def __init__(self, pos, surf, groups, z = WORLD_LAYERS['main']):
+		super().__init__(groups)
+		self.image = surf 
+		self.rect = self.image.get_frect(topleft = pos)
+		self.z = z
+		self.y_sort = self.rect.centery
+		self.hitbox = self.rect.copy()
+
+class BorderSprite(Sprite):
+	def __init__(self, pos, surf, groups):
+		super().__init__(pos, surf, groups)
+		self.hitbox = self.rect.copy()
+
+class TransitionSprite(Sprite):
+	def __init__(self, pos, size, target, groups):
+		surf = pygame.Surface(size)
+		super().__init__(pos, surf, groups)
+		self.target = target
+
+class CollidableSprite(Sprite):
+	def __init__(self, pos, surf, groups):
+		super().__init__(pos, surf, groups)
+		self.hitbox = self.rect.inflate(0, -self.rect.height * 0.6)
+
+class MonsterPatchSprite(Sprite):
+	def __init__(self, pos, surf, groups, biome, monsters, level):
+		self.biome = biome
+		super().__init__(pos, surf, groups, WORLD_LAYERS['main' if biome != 'sand' else 'bg'])
+		self.y_sort -= 40
+		self.biome = biome
+		self.monsters = monsters.split(',')
+		self.level = level
+
+class AnimatedSprite(Sprite):
+	def __init__(self, pos, frames, groups, z = WORLD_LAYERS['main']):
+		self.frame_index, self.frames = 0, frames
+		super().__init__(pos, frames[self.frame_index], groups, z)
+
+	def animate(self, dt):
+		self.frame_index += ANIMATION_SPEED * dt
+		self.image = self.frames[int(self.frame_index % len(self.frames))]
+
+	def update(self, dt):
+		self.animate(dt)
+
+# battle sprites 
+class MonsterSprite(pygame.sprite.Sprite):
+	def __init__(self, pos, frames, groups, monster, index, pos_index, entity, apply_attack, create_monster):
+		# data
+		self.index = index 
+		self.pos_index = pos_index
+		self.entity = entity
+		self.monster = monster
+		self.frame_index, self.frames, self.state = 0, frames, 'idle'
+		self.animation_speed = ANIMATION_SPEED + uniform(-1, 1)
+		self.z = BATTLE_LAYERS['monster']
+		self.highlight = False
+		self.target_sprite = None
+		self.current_attack = None
+		self.apply_attack = apply_attack
+		self.create_monster = create_monster
+
+		# sprite setup
+		super().__init__(groups)
+		self.image = self.frames[self.state][self.frame_index]
+		self.rect = self.image.get_frect(center = pos)
+
+		# timers 
+		self.timers = {
+			'remove highlight': Timer(300, func = lambda: self.set_highlight(False)),
+			'kill': Timer(600, func = self.destroy)
+		}
+
+	def animate(self, dt):
+		self.frame_index += ANIMATION_SPEED * dt
+		if self.state == 'attack' and self.frame_index >= len(self.frames['attack']):
+			self.apply_attack(self.target_sprite, self.current_attack, self.monster.get_base_damage(self.current_attack))
+			self.state = 'idle'
+
+		self.adjusted_frame_index = int(self.frame_index % len(self.frames[self.state]))
+		self.image = self.frames[self.state][self.adjusted_frame_index]
+
+		if self.highlight:
+			white_surf = pygame.mask.from_surface(self.image).to_surface()
+			white_surf.set_colorkey('black')
+			self.image = white_surf
+
+	def set_highlight(self, value):
+		self.highlight = value
+		if value: 
+			self.timers['remove highlight'].activate()
+
+	def activate_attack(self, target_sprite, attack):
+		self.state = 'attack'
+		self.frame_index = 0
+		self.target_sprite = target_sprite
+		self.current_attack = attack
+		self.monster.reduce_energy(attack)
+
+	def delayed_kill(self, new_monster):
+		if not self.timers['kill'].active:
+			self.next_monster_data = new_monster
+			self.timers['kill'].activate()
+
+	def destroy(self):
+		if self.next_monster_data:
+			self.create_monster(*self.next_monster_data)
+		self.kill()
+
+	def update(self, dt):
+		for timer in self.timers.values():
+			timer.update()
+		self.animate(dt)
+		self.monster.update(dt)
+
+class MonsterOutlineSprite(pygame.sprite.Sprite):
+	def __init__(self, monster_sprite, groups, frames):
+		super().__init__(groups)
+		self.z = BATTLE_LAYERS['outline']
+		self.monster_sprite = monster_sprite
+		self.frames = frames
+
+		self.image = self.frames[self.monster_sprite.state][self.monster_sprite.frame_index]
+		self.rect = self.image.get_frect(center = self.monster_sprite.rect.center)
+
+	def update(self, _):
+		self.image = self.frames[self.monster_sprite.state][self.monster_sprite.adjusted_frame_index]
+		if not self.monster_sprite.groups():
+			self.kill()
+
+class MonsterNameSprite(pygame.sprite.Sprite):
+	def __init__(self, pos, monster_sprite, groups, font):
+		super().__init__(groups)
+		self.monster_sprite = monster_sprite
+		self.z = BATTLE_LAYERS['name']
+
+		text_surf = font.render(monster_sprite.monster.name, False, COLORS['black'])
+		padding = 10
+
+		self.image = pygame.Surface((text_surf.get_width() + 2 * padding, text_surf.get_height() + 2 * padding)) 
+		self.image.fill(COLORS['white'])
+		self.image.blit(text_surf, (padding, padding))
+		self.rect = self.image.get_frect(midtop = pos)
+
+	def update(self, _):
+		if not self.monster_sprite.groups():
+			self.kill()
+
+class MonsterLevelSprite(pygame.sprite.Sprite):
+	def __init__(self, entity, pos, monster_sprite, groups, font):
+		super().__init__(groups)
+		self.monster_sprite = monster_sprite
+		self.font = font
+		self.z = BATTLE_LAYERS['name']
+
+		self.image = pygame.Surface((60,26))
+		self.rect = self.image.get_frect(topleft = pos) if entity == 'player' else self.image.get_frect(topright = pos)
+		self.xp_rect = pygame.FRect(0,self.rect.height - 2,self.rect.width,2)
+
+	def update(self, _):
+		self.image.fill(COLORS['white'])
+
+		text_surf = self.font.render(f'Lvl {self.monster_sprite.monster.level}', False, COLORS['black'])
+		text_rect = text_surf.get_frect(center = (self.rect.width / 2, self.rect.height / 2))
+		self.image.blit(text_surf, text_rect)
+
+		draw_bar(self.image, self.xp_rect, self.monster_sprite.monster.xp, self.monster_sprite.monster.level_up, COLORS['black'], COLORS['white'], 0)
+
+		if not self.monster_sprite.groups():
+			self.kill()
+
+class MonsterStatsSprite(pygame.sprite.Sprite):
+	def __init__(self, pos, monster_sprite, size, groups, font):
+		super().__init__(groups)
+		self.monster_sprite = monster_sprite
+		self.image = pygame.Surface(size) 
+		self.rect = self.image.get_frect(midbottom = pos)
+		self.font = font
+		self.z = BATTLE_LAYERS['overlay']
+
+	def update(self, _):
+		self.image.fill(COLORS['white'])
+
+		for index, (value, max_value) in enumerate(self.monster_sprite.monster.get_info()):
+			color = (COLORS['red'], COLORS['blue'], COLORS['gray'])[index]
+			if index < 2: # health and energy 
+				text_surf = self.font.render(f'{int(value)}/{max_value}', False, COLORS['black'])
+				text_rect = text_surf.get_frect(topleft = (self.rect.width * 0.05,index * self.rect.height / 2))
+				bar_rect = pygame.FRect(text_rect.bottomleft + vector(0,-2), (self.rect.width * 0.9, 4))
+
+				self.image.blit(text_surf, text_rect)
+				draw_bar(self.image, bar_rect, value, max_value, color, COLORS['black'], 2)
+			else: # initiative
+				init_rect = pygame.FRect((0, self.rect.height - 2), (self.rect.width, 2)) 
+				draw_bar(self.image, init_rect, value, max_value, color, COLORS['white'], 0)
+
+		if not self.monster_sprite.groups():
+			self.kill()
+
+class AttackSprite(AnimatedSprite):
+	def __init__(self, pos, frames, groups):
+		super().__init__(pos, frames, groups, BATTLE_LAYERS['overlay'])
+		self.rect.center = pos
+
+	def animate(self, dt):
+		self.frame_index += ANIMATION_SPEED * dt
+		if self.frame_index < len(self.frames):
+			self.image = self.frames[int(self.frame_index)]
+		else:
+			self.kill()
+
+	def update(self, dt):
+		self.animate(dt)
+
+class TimedSprite(Sprite):
+	def __init__(self, pos, surf, groups, duration):
+		super().__init__(pos, surf, groups, z = BATTLE_LAYERS['overlay'])
+		self.rect.center = pos
+		self.death_timer = Timer(duration, autostart = True, func = self.kill)
+
+	def update(self, _):
+		self.death_timer.update()
+
+================================================================================
+FILE: D:\Monster-Catcher\code\support.py
+================================================================================
+from settings import *
+from os.path import join
+from os import walk
+from pytmx.util_pygame import load_pygame
+
+# import functions
+def import_image(*path, alpha = True, format = 'png'):
+	full_path = join(*path) + f'.{format}'
+	surf = pygame.image.load(full_path).convert_alpha() if alpha else pygame.image.load(full_path).convert()
+	return surf
+
+def import_folder(*path):
+	frames = []
+	for folder_path, sub_folders, image_names in walk(join(*path)):
+		for image_name in sorted(image_names, key = lambda name: int(name.split('.')[0])):
+			full_path = join(folder_path, image_name)
+			surf = pygame.image.load(full_path).convert_alpha()
+			frames.append(surf)
+	return frames
+
+def import_folder_dict(*path):
+	frames = {}
+	for folder_path, sub_folders, image_names in walk(join(*path)):
+		for image_name in image_names:
+			full_path = join(folder_path, image_name)
+			surf = pygame.image.load(full_path).convert_alpha()
+			frames[image_name.split('.')[0]] = surf
+	return frames
+
+def import_sub_folders(*path):
+	frames = {}
+	for _, sub_folders, __ in walk(join(*path)):
+		if sub_folders:
+			for sub_folder in sub_folders:
+				frames[sub_folder] = import_folder(*path, sub_folder)
+	return frames
+
+def import_tilemap(cols, rows, *path):
+	frames = {}
+	surf = import_image(*path)
+	cell_width, cell_height = surf.get_width() / cols, surf.get_height() / rows
+	for col in range(cols):
+		for row in range(rows):
+			cutout_rect = pygame.Rect(col * cell_width, row * cell_height,cell_width,cell_height)
+			cutout_surf = pygame.Surface((cell_width, cell_height))
+			cutout_surf.fill('green')
+			cutout_surf.set_colorkey('green')
+			cutout_surf.blit(surf, (0,0), cutout_rect)
+			frames[(col, row)] = cutout_surf
+	return frames
+
+def character_importer(cols, rows, *path):
+	frame_dict = import_tilemap(cols, rows, *path)
+	new_dict = {}
+	for row, direction in enumerate(('down', 'left', 'right', 'up')):
+		new_dict[direction] = [frame_dict[(col, row)] for col in range(cols)]
+		new_dict[f'{direction}_idle'] = [frame_dict[(0, row)]]
+	return new_dict
+
+def all_character_import(*path):
+	new_dict = {}
+	for _, __, image_names in walk(join(*path)):
+		for image in image_names:
+			image_name = image.split('.')[0]
+			new_dict[image_name] = character_importer(4,4,*path, image_name)
+	return new_dict
+
+def coast_importer(cols, rows, *path):
+	frame_dict = import_tilemap(cols, rows, *path)
+	new_dict = {}
+	terrains = ['grass', 'grass_i', 'sand_i', 'sand', 'rock', 'rock_i', 'ice', 'ice_i']
+	sides = {
+		'topleft': (0,0), 'top': (1,0), 'topright': (2,0), 
+		'left': (0,1), 'right': (2,1), 'bottomleft': (0,2), 
+		'bottom': (1,2), 'bottomright': (2,2)}
+	for index, terrain in enumerate(terrains):
+		new_dict[terrain] = {}
+		for key, pos in sides.items():
+			new_dict[terrain][key] = [frame_dict[(pos[0] + index * 3, pos[1] + row)] for row in range(0,rows, 3)]
+	return new_dict
+
+def tmx_importer(*path):
+	tmx_dict = {}
+	for folder_path, sub_folders, file_names in walk(join(*path)):
+		for file in file_names:
+			tmx_dict[file.split('.')[0]] = load_pygame(join(folder_path, file))
+	return tmx_dict
+
+def monster_importer(cols, rows, *path):
+	monster_dict = {}
+	for folder_path, sub_folders, image_names in walk(join(*path)):
+		for image in image_names:
+			image_name = image.split('.')[0]
+			monster_dict[image_name] = {}
+			frame_dict = import_tilemap(cols, rows, *path, image_name)
+			for row, key in enumerate(('idle', 'attack')):
+				monster_dict[image_name][key] = [frame_dict[(col,row)] for col in range(cols)]
+	return monster_dict
+
+def outline_creator(frame_dict, width):
+	outline_frame_dict = {}
+	for monster, monster_frames in frame_dict.items():
+		outline_frame_dict[monster] = {}
+		for state, frames in monster_frames.items():
+			outline_frame_dict[monster][state] = []
+			for frame in frames:
+				new_surf = pygame.Surface(vector(frame.get_size()) + vector(width * 2), pygame.SRCALPHA)
+				new_surf.fill((0,0,0,0))
+				white_frame = pygame.mask.from_surface(frame).to_surface()
+				white_frame.set_colorkey('black')
+
+				new_surf.blit(white_frame, (0,0))
+				new_surf.blit(white_frame, (width,0))
+				new_surf.blit(white_frame, (width * 2,0))
+				new_surf.blit(white_frame, (width * 2,width))
+				new_surf.blit(white_frame, (width * 2,width * 2))
+				new_surf.blit(white_frame, (width,width * 2))
+				new_surf.blit(white_frame, (0,width * 2))
+				new_surf.blit(white_frame, (0,width))
+				outline_frame_dict[monster][state].append(new_surf)
+	return outline_frame_dict
+
+def attack_importer(*path):
+	attack_dict = {}
+	for folder_path, _, image_names in walk(join(*path)):
+		for image in image_names:
+			image_name = image.split('.')[0]
+			attack_dict[image_name] = list(import_tilemap(4,1,folder_path, image_name).values())
+	return attack_dict
+
+def audio_importer(*path):
+	files = {}
+	for folder_path, _, file_names in walk(join(*path)):
+		for file_name in file_names:
+			full_path = join(folder_path, file_name)
+			files[file_name.split('.')[0]] = pygame.mixer.Sound(full_path)
+	return files
+
+# game functions
+def draw_bar(surface, rect, value, max_value, color, bg_color, radius = 1):
+	ratio = rect.width / max_value
+	bg_rect = rect.copy()
+	progress = max(0, min(rect.width,value * ratio))
+	progress_rect = pygame.FRect(rect.topleft, (progress,rect.height))
+	pygame.draw.rect(surface, bg_color, bg_rect, 0, radius)
+	pygame.draw.rect(surface, color, progress_rect, 0, radius)
+
+def check_connections(radius, entity, target, tolerance = 30):
+	relation = vector(target.rect.center) - vector(entity.rect.center)
+	if relation.length() < radius:
+		if entity.facing_direction == 'left' and relation.x < 0 and abs(relation.y) < tolerance or\
+		   entity.facing_direction == 'right' and relation.x > 0 and abs(relation.y) < tolerance or\
+		   entity.facing_direction == 'up' and relation.y < 0 and abs(relation.x) < tolerance or\
+		   entity.facing_direction == 'down' and relation.y > 0 and abs(relation.x) < tolerance:
+			return True
+
+================================================================================
+FILE: D:\Monster-Catcher\code\timer.py
+================================================================================
+from pygame.time import get_ticks
+
+class Timer:
+	def __init__(self, duration, repeat = False, autostart = False, func = None):
+		self.duration = duration
+		self.start_time = 0
+		self.active = False
+		self.repeat = repeat
+		self.func = func
+		if autostart:
+			self.activate()
+
+	def activate(self):
+		self.active = True
+		self.start_time = get_ticks()
+
+	def deactivate(self):
+		self.active = False
+		self.start_time = 0
+		if self.repeat:
+			self.activate()
+
+	def update(self):
+		if self.active:
+			current_time = get_ticks()
+			if current_time - self.start_time >= self.duration:
+				if self.func: self.func()
+				self.deactivate()
